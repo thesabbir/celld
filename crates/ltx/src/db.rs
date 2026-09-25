@@ -918,6 +918,33 @@ impl Db {
         Ok(baseline)
     }
 
+    /// Seeds a local baseline at `txid` that no WAL matches: its salts are
+    /// the current WAL's inverted, so the next [`Db::sync`] sees a salt reset
+    /// and captures the whole database at `txid + 1`. For a database behind
+    /// its replica (see `Replica::check_database_behind_replica`): whatever
+    /// state it is in, the snapshot carries all of it, on top of any chain.
+    pub fn seed_snapshot_baseline(&mut self, txid: TXID) -> Result<()> {
+        let wal = self.wal_header_bytes()?;
+        let commit = (self.db_file_size()? / i64::from(self.page_size)) as u32;
+        let header = ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: self.page_size,
+            commit: commit.max(1),
+            min_txid: txid,
+            max_txid: txid,
+            timestamp: self.host.now_unix_millis(),
+            pre_apply_checksum: 0,
+            wal_offset: WAL_HEADER_SIZE as i64,
+            wal_size: 0,
+            wal_salt1: !be_u32(&wal[16..]),
+            wal_salt2: !be_u32(&wal[20..]),
+            node_id: 0,
+        };
+        let baseline = ltx::encode_file(&header, &[], 0)?;
+        self.seed_l0_baseline(txid, txid, &baseline)
+    }
+
     // ── Capture loop ───────────────────────────────────────────────────────
 
     /// Where one `sync` call's wall time went, phase by phase. The phases
