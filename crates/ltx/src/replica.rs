@@ -158,6 +158,20 @@ impl<C: ReplicaClient> Replica<C> {
         self.db.as_mut()
     }
 
+    /// Detaches the database, so its synchronous capture ([`Db::sync`],
+    /// [`Db::snapshot_to_writer`]) can run on a blocking thread instead of an
+    /// async one; [`Self::attach_db`] puts it back. A sync with no database
+    /// attached fails. Not upstream.
+    pub fn take_db(&mut self) -> Option<Db> {
+        self.db.take()
+    }
+
+    /// Attaches `db` in place of any database attached now. See
+    /// [`Self::take_db`].
+    pub fn attach_db(&mut self, db: Db) {
+        self.db = Some(db);
+    }
+
     /// The current replicated position. Ported from `Replica.Pos`
     /// (replica.go:237-241).
     pub fn pos(&self) -> Pos {
