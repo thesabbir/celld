@@ -2044,6 +2044,15 @@ impl Db {
     /// The snapshot spans `MinTXID=1 .. MaxTXID=pos.TXID` (db.go:1996-1997). Its
     /// page set is the full DB (lock page skipped), and — being a snapshot — the
     /// rolling post-apply checksum **is** tracked.
+    ///
+    /// It holds the state at `pos.TXID` and nothing after: the WAL is read
+    /// only up to where the last capture ended. Upstream reads the whole live
+    /// WAL, so a commit landing between the capture and the snapshot went
+    /// into a snapshot labelled with the older txid, and a restore to that
+    /// txid brought it back. Pages absent from that prefix come from the
+    /// database file, which holds nothing past the capture: only this `Db`
+    /// checkpoints, and it captures first. A WAL restarted since the capture
+    /// is refused; sync first.
     pub fn snapshot_to_writer<W: std::io::Write>(&mut self, w: &mut W) -> Result<Pos> {
         if self.page_size == 0 {
             return Err(Error::Other(
@@ -2056,7 +2065,25 @@ impl Db {
         let db_size = self.db_file_size()?;
         let mut commit = (db_size / self.page_size as i64) as u32;
 
-        let wal = WalImage::whole(self.host.read(&self.wal_path())?);
+        let mut bytes = self.host.read(&self.wal_path())?;
+        if pos.txid != TXID(0) {
+            let (end, salt1, salt2) = self.captured_wal_end(pos.txid)?;
+            let live = (
+                bytes.get(16..20).map_or(0, be_u32),
+                bytes.get(20..24).map_or(0, be_u32),
+            );
+            if live != (salt1, salt2) {
+                return Err(Error::Other(
+                    format!(
+                        "the WAL restarted after the capture at txid {}; sync before a snapshot",
+                        pos.txid.0
+                    )
+                    .into(),
+                ));
+            }
+            bytes.truncate(usize::try_from(end).unwrap_or(usize::MAX));
+        }
+        let wal = WalImage::whole(bytes);
         let mut rd = WalReader::new(&wal.bytes).map_err(Error::from)?;
         let (page_map, max_offset, wal_commit) = rd.page_map().map_err(Error::from)?;
         if wal_commit > 0 {
@@ -2102,6 +2129,20 @@ impl Db {
         w.write_all(&encoded)?;
 
         Ok(Pos::new(pos.txid, rolling))
+    }
+
+    /// Where the capture at `txid` ended in the WAL, and the WAL's salts
+    /// then: from the header this instance cached, else from the L0 file.
+    fn captured_wal_end(&self, txid: TXID) -> Result<(i64, u32, u32)> {
+        if let Some((cached, hdr)) = &self.last_l0_header {
+            if *cached == txid {
+                return Ok((hdr.wal_offset + hdr.wal_size, hdr.wal_salt1, hdr.wal_salt2));
+            }
+        }
+        let ltx_path = self.ltx_path(0, txid, txid);
+        let bytes = self.host.read(Path::new(&ltx_path))?;
+        let hdr = ltx::Header::parse(&bytes).map_err(|_| Error::LTXCorrupted)?;
+        Ok((hdr.wal_offset + hdr.wal_size, hdr.wal_salt1, hdr.wal_salt2))
     }
 
     /// Closes the database, releasing the read lock first so other processes can
