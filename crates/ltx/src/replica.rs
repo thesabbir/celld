@@ -283,15 +283,25 @@ impl<C: ReplicaClient> Replica<C> {
         Ok(())
     }
 
-    /// Returns the last position saved to the replica for level 0.
+    /// Returns the last position saved to the replica, across every level.
     ///
     /// Ported from `Replica.calcPos` (replica.go:208-214) + `MaxLTXFileInfo`
-    /// (replica.go:218-233): scans the L0 listing for the highest `max_txid`.
+    /// (replica.go:218-233), which scan L0 alone. Once compaction has covered
+    /// L0 and retention has deleted it, L0 is empty or behind, and a position
+    /// read from it alone restarts the upload at a txid whose local file is
+    /// long pruned. Every level's newest file ends at a committed position,
+    /// with its post-apply checksum, so the highest of them is the replica's.
     async fn calc_pos(&self) -> Result<Pos> {
-        let info = self
-            .max_ltx_file_info(0)
-            .await
-            .map_err(|e| Error::Other(format!("max ltx file: {e}").into()))?;
+        let mut info = FileInfo::default();
+        for level in 0..=SNAPSHOT_LEVEL {
+            let newest = self
+                .max_ltx_file_info(level)
+                .await
+                .map_err(|e| Error::Other(format!("max ltx file: {e}").into()))?;
+            if newest.max_txid > info.max_txid {
+                info = newest;
+            }
+        }
         Ok(Pos::new(info.max_txid, info.post_apply_checksum))
     }
 
