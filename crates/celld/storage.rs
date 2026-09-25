@@ -1300,7 +1300,7 @@ pub(crate) fn open_embedded(
     let mut connection = Connection::open_in_memory()?;
     if let Some(image) = image {
         connection.deserialize(
-            rusqlite::DatabaseName::Main,
+            rusqlite::MAIN_DB,
             owned_sqlite_data(&image)?,
             false,
         )?;
@@ -1374,7 +1374,7 @@ pub(crate) fn flush_embedded(scope: &str) -> EmbeddedFlush {
             });
         }
         let image = without_sql_authorizer(&cell.connection, || {
-            cell.connection.serialize(rusqlite::DatabaseName::Main)
+            cell.connection.serialize(rusqlite::MAIN_DB)
         })
         .context("serialize the facet database")?
         .to_vec();
