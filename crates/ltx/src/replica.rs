@@ -331,29 +331,36 @@ impl<C: ReplicaClient> Replica<C> {
 
     /// Detects when the local database has been restored to an earlier state
     /// than the replica (a lower TXID) and, if so, seeds the local L0 directory
-    /// with the replica's newest L0 file so the next sync snapshots forward.
+    /// with a baseline at the replica's position that no WAL matches, so the
+    /// next sync snapshots forward.
     ///
     /// Ported from `DB.checkDatabaseBehindReplica` (db.go:1211-1294), issue #781.
     /// In upstream this runs inside `DB.init()` because the `DB` owns its
     /// `Replica`; our synchronous `Db` does not, so the orchestration lives here
     /// on `Replica` and a host calls it once after [`Db::open`], before the first
-    /// sync. The file-writing tail is [`Db::seed_l0_baseline`].
+    /// sync. The file-writing tail is [`Db::seed_snapshot_baseline`].
     ///
     /// Without this, a hard recovery (restore an old snapshot, reopen, write new
     /// data) would silently drop the new writes: the fresh local DB snapshots at
     /// TXID 1, but [`Replica::sync`] computes the replica position from the
     /// remote's higher `MaxTXID`, so its upload loop (`pos+1 ..= db.pos`) never
-    /// runs (`pos+1` already exceeds the local DB's TXID). Seeding the remote
-    /// baseline makes the next [`Db::sync`] see a continuity break and snapshot at
-    /// the current (post-restore-plus-writes) state, which then uploads.
+    /// runs (`pos+1` already exceeds the local DB's TXID). Seeding the baseline
+    /// makes the next [`Db::sync`] see a continuity break and snapshot at the
+    /// current (post-restore-plus-writes) state, which then uploads.
+    ///
+    /// The replica's position is read across every level, as in `calc_pos`:
+    /// upstream reads L0 alone, which compaction and retention may have
+    /// emptied. And the baseline is built locally rather than downloaded,
+    /// since the newest file may be an L1 file or a snapshot, whose range a
+    /// local L0 file cannot stand for.
     ///
     /// No-op (returns `Ok`) when there is no remote data, when the database is at
     /// or ahead of the replica, or when there is no attached database.
     pub async fn check_database_behind_replica(&mut self) -> Result<()> {
         // Replica position from remote (db.go:1224-1230). Done first so a
         // restore-only replica with no DB is a clean no-op.
-        let replica_info = self.max_ltx_file_info(0).await?;
-        if replica_info.max_txid == TXID(0) {
+        let replica_pos = self.calc_pos().await?;
+        if replica_pos.txid == TXID(0) {
             return Ok(()); // no remote replica data yet
         }
 
@@ -368,25 +375,15 @@ impl<C: ReplicaClient> Replica<C> {
             .map_err(|e| Error::Other(format!("get database position: {e}").into()))?;
 
         // If the database is ahead or equal, nothing to do (db.go:1232-1235).
-        if db_pos.txid >= replica_info.max_txid {
+        if db_pos.txid >= replica_pos.txid {
             return Ok(());
         }
 
-        // Fetch the latest L0 LTX file from the replica (db.go:1251-1257).
-        let min_txid = replica_info.min_txid;
-        let max_txid = replica_info.max_txid;
-        let data = self
-            .client
-            .open_ltx_file(0, min_txid, max_txid)
-            .await
-            .map_err(|e| Error::Other(format!("open remote L0 file: {e}").into()))?;
+        db.seed_snapshot_baseline(replica_pos.txid)?;
 
-        // Seed it as the local baseline (db.go:1259-1293).
-        db.seed_l0_baseline(min_txid, max_txid, &data)?;
-
-        // Drop the now-stale cached replica position so the next sync recomputes
-        // it from the remote (mirrors clearing pos on a state change).
-        self.pos = Pos::ZERO;
+        // The replica's position is known now: the next sync uploads the
+        // snapshot at `replica_pos + 1` and nothing before it.
+        self.seed_pos(replica_pos);
         Ok(())
     }
 }
