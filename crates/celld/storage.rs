@@ -1080,7 +1080,7 @@ pub(crate) fn open_embedded(
         if let Some(image) = image {
             let mut source = Connection::open_in_memory()?;
             source.deserialize(
-                rusqlite::DatabaseName::Main,
+                rusqlite::MAIN_DB,
                 owned_sqlite_data(&image)?,
                 true,
             )?;
