@@ -27,9 +27,13 @@ disallowed_macros = "forbid"
 
 [features]
 default = ["s3"]
-s3 = ["object_store/aws"]
-gcs = ["object_store/gcp"]
-azure = ["object_store/azure"]
+s3 = ["object_store/aws-base", "_tls-ring"]
+gcs = ["object_store/gcp-base", "_tls-ring"]
+azure = ["object_store/azure-base", "_tls-ring"]
+# object_store's `aws`/`gcp`/`azure` features switch rustls to aws-lc-rs; a
+# host already on ring then has two providers and no process default. Sign and
+# connect on ring instead, and leave the TLS provider to the host.
+_tls-ring = ["object_store/reqwest", "object_store/ring", "dep:reqwest-tls"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
@@ -37,6 +41,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 # links="sqlite3", so the workspace cannot hold two versions.
 rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 object_store.workspace = true
+# object_store's own reqwest, named only to give it TLS without a provider.
+reqwest-tls = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
 bytes.workspace = true
 chrono.workspace = true
 thiserror.workspace = true

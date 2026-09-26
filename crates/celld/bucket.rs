@@ -49,6 +49,7 @@ use object_store::GetRange;
 use object_store::MultipartUpload;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::PutMode;
 use object_store::PutMultipartOptions;
 use object_store::PutOptions;
@@ -259,7 +260,7 @@ pub fn cas_write_did_not_commit(error: &anyhow::Error) -> bool {
                 | Error::NotFound { .. }
                 | Error::InvalidPath { .. }
                 | Error::NotSupported { .. }
-                | Error::NotImplemented
+                | Error::NotImplemented { .. }
                 | Error::UnknownConfigurationKey { .. }
         )
     })
@@ -1813,7 +1814,7 @@ fn is_unsupported_operation(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if matches!(
             cause.downcast_ref::<Error>(),
-            Some(Error::NotSupported { .. } | Error::NotImplemented)
+            Some(Error::NotSupported { .. } | Error::NotImplemented { .. })
         ) {
             return true;
         }
