@@ -50,7 +50,9 @@ hyper-util.workspace = true
 md-5.workspace = true
 notify.workspace = true
 nu-ansi-term.workspace = true
-object_store = { workspace = true, features = ["aws", "azure", "gcp"] }
+# The `-base` features keep rustls on ring (the plain ones switch it to
+# aws-lc-rs); TLS for object_store's reqwest comes through celld-ltx's `s3`.
+object_store = { workspace = true, features = ["aws-base", "azure-base", "gcp-base", "reqwest", "ring"] }
 parquet.workspace = true
 pbkdf2.workspace = true
 percent-encoding.workspace = true
