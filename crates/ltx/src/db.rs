@@ -590,6 +590,22 @@ impl Db {
         Ok(self.host.read(Path::new(&path))?)
     }
 
+    /// Opens a local LTX file for a streamed upload.
+    pub(crate) fn open_ltx_file(
+        &self,
+        level: u32,
+        min_txid: TXID,
+        max_txid: TXID,
+    ) -> Result<crate::host::HostFile> {
+        let path = self.ltx_path(level, min_txid, max_txid);
+        Ok(self.host.open(Path::new(&path))?)
+    }
+
+    /// The host this database does its I/O through.
+    pub(crate) fn host(&self) -> &crate::LtxHost {
+        &self.host
+    }
+
     /// The SQLite page size, in bytes. Ported from `DB.PageSize` (db.go:445).
     pub fn page_size(&self) -> u32 {
         self.page_size

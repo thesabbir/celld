@@ -280,17 +280,21 @@ impl<C: ReplicaClient> Replica<C> {
             .ok_or_else(|| Error::Other("no database attached to replica".into()))?;
         let filename = db.ltx_path(level as u32, min_txid, max_txid);
 
-        let data = match db.read_ltx_file(level as u32, min_txid, max_txid) {
-            Ok(b) => b,
+        // Upload from the file, never a buffer: a boundary-image L0 is the
+        // size of the database. A client without file uploads fails the
+        // upload loudly rather than falling back to buffering it.
+        let file = match db.open_ltx_file(level as u32, min_txid, max_txid) {
+            Ok(f) => f,
             Err(e) => {
                 return Err(Error::Ltx(Box::new(new_ltx_error(
                     "open", &filename, level, min_txid.0, max_txid.0, e,
                 ))));
             }
         };
+        let host = db.host().clone();
 
         self.client
-            .write_ltx_file(level, min_txid, max_txid, &data)
+            .write_ltx_file_from_file(level, min_txid, max_txid, file, host)
             .await
             .map_err(|e| Error::Other(format!("write ltx file: {e}").into()))?;
 

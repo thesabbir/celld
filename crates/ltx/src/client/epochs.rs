@@ -160,6 +160,20 @@ impl<C: ReplicaClient> ReplicaClient for EpochChain<C> {
             .await
     }
 
+    async fn write_ltx_file_from_file(
+        &self,
+        level: i32,
+        min_txid: TXID,
+        max_txid: TXID,
+        file: crate::host::HostFile,
+        host: crate::LtxHost,
+    ) -> Result<FileInfo> {
+        self.span(min_txid)
+            .client
+            .write_ltx_file_from_file(level, min_txid, max_txid, file, host)
+            .await
+    }
+
     async fn delete_ltx_files(&self, files: &[FileInfo]) -> Result<()> {
         for file in files {
             self.span(file.min_txid)
