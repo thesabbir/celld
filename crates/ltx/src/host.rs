@@ -73,6 +73,19 @@ impl HostFile {
     }
 }
 
+/// Appends, so a snapshot or compaction can stream into a scratch file that
+/// [`ReplicaClient::write_ltx_file_from_file`](crate::client::ReplicaClient::write_ltx_file_from_file)
+/// then uploads without holding its body.
+impl io::Write for HostFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The complete local-file surface used by celld and the LTX engine.
 pub trait FileSystem: Send + Sync {
     /// Opens an anonymous read/write scratch file. The handle owns its storage,

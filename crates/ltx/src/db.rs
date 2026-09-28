@@ -2038,8 +2038,26 @@ impl Db {
     // ── Snapshot ───────────────────────────────────────────────────────────
 
     /// Writes a full database snapshot as an LTX file to `w` and returns the
-    /// snapshot position. Ported from `DB.SnapshotReader` (db.go:1922-2021),
-    /// buffered rather than streamed, as described in `client/mod.rs`.
+    /// snapshot position. Ported from `DB.SnapshotReader` (db.go:1922-2021).
+    ///
+    /// Streamed: each page is read, checksummed and encoded into `w` before the
+    /// next, so the heap holds one page, the encoder's page index and the WAL
+    /// image (whose page map needs the whole-WAL checksum walk) — never the
+    /// database. `w` sees many small writes; wrap a file in a `BufWriter`.
+    /// To upload without buffering the file in memory, write into a host
+    /// scratch file and hand it to
+    /// [`ReplicaClient::write_ltx_file_from_file`](crate::client::ReplicaClient::write_ltx_file_from_file):
+    ///
+    /// ```ignore
+    /// let mut file = host.filesystem().temporary_file(None)?;
+    /// let pos = {
+    ///     let mut out = std::io::BufWriter::new(&mut file);
+    ///     let pos = db.snapshot_to_writer(&mut out)?;
+    ///     out.flush()?;
+    ///     pos
+    /// };
+    /// client.write_ltx_file_from_file(SNAPSHOT_LEVEL, TXID(1), pos.txid, file, host).await?;
+    /// ```
     ///
     /// The snapshot spans `MinTXID=1 .. MaxTXID=pos.TXID` (db.go:1996-1997). Its
     /// page set is the full DB (lock page skipped), and — being a snapshot — the
@@ -2097,18 +2115,6 @@ impl Db {
         };
         let (salt1, salt2) = rd.salt();
 
-        let pages = self.collect_snapshot_pages(&wal, &page_map, commit)?;
-
-        // A snapshot tracks the rolling post-apply checksum (MinTXID==1, no
-        // NoChecksum flag) — compute it the way decode_file verifies it.
-        let lock = lock_pgno(self.page_size);
-        let mut rolling: crate::Checksum = crate::CHECKSUM_FLAG;
-        for (p, d) in &pages {
-            if *p != lock {
-                rolling = crate::CHECKSUM_FLAG | (rolling ^ ltx::checksum_page(*p, d));
-            }
-        }
-
         let header = ltx::Header {
             version: ltx::VERSION,
             flags: 0,
@@ -2125,8 +2131,23 @@ impl Db {
             node_id: 0,
         };
 
-        let encoded = ltx::encode_file(&header, &pages, rolling)?;
-        w.write_all(&encoded)?;
+        // One page at a time, straight into `w`. A snapshot tracks the rolling
+        // post-apply checksum (MinTXID==1, no NoChecksum flag), which lives in
+        // the trailer, so it accumulates as the pages go by and nothing but the
+        // encoder's page index outlives a page.
+        let mut encoder = crate::codec::Encoder::new_legacy(w);
+        encoder.encode_header(header)?;
+        let mut rolling: crate::Checksum = crate::CHECKSUM_FLAG;
+        let lock = lock_pgno(self.page_size);
+        for pgno in (1..=commit).filter(|pgno| *pgno != lock) {
+            let data = match page_map.get(&pgno) {
+                Some(&offset) => wal.page(offset, self.page_size)?,
+                None => self.read_db_page(pgno)?,
+            };
+            rolling = crate::CHECKSUM_FLAG | (rolling ^ ltx::checksum_page(pgno, &data));
+            encoder.encode_page(ltx::PageHeader { pgno, flags: 0 }, &data)?;
+        }
+        encoder.close(rolling)?;
 
         Ok(Pos::new(pos.txid, rolling))
     }
