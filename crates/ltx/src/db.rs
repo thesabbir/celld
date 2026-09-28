@@ -239,6 +239,8 @@ pub struct SyncTiming {
     /// What `verify` read of the WAL to tell a restart from a missed
     /// FULL or RESTART checkpoint.
     pub restart_scan_bytes: u64,
+    /// WAL frames whose checksum the capture walked, over every pass.
+    pub wal_frames_parsed: u64,
     /// Which verify branch forced the snapshot: 0 none, 1 first sync,
     /// 2 wal truncated by another process, 3 salt reset, 4 last page
     /// missing from the last L0, 5 full or restart checkpoint detected,
@@ -1368,12 +1370,18 @@ impl Db {
     /// that were read. The geometric window keeps parsing linear overall and
     /// reads at most one prior window past the valid end. The returned byte
     /// count includes that discarded probe for an honest I/O ledger.
-    fn read_valid_wal_image(&mut self, info: &SyncInfo, start: usize) -> Result<(WalImage, usize)> {
+    fn read_valid_wal_image(
+        &mut self,
+        info: &SyncInfo,
+        start: usize,
+    ) -> Result<(WalImage, usize, u64, Option<ParsedTail>)> {
         let frame_size = self.page_size as usize + WAL_FRAME_HEADER_SIZE;
         let offset = info.offset;
-        let salt1 = info.salt1;
-        let salt2 = info.salt2;
+        let info_salts = (info.salt1, info.salt2);
         Ok(self.with_wal_file(|file| {
+            let (mut salt1, mut salt2) = info_salts;
+            let mut tail: Option<ParsedTail> = None;
+            let mut parsed_frames = 0_u64;
             let file_len = file.file_len()? as usize;
             if file_len < WAL_HEADER_SIZE || start < WAL_HEADER_SIZE || start >= file_len {
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
@@ -1400,16 +1408,23 @@ impl Db {
                     cursor = target_end;
                 }
 
+                // Each round walks only the frames past the last commit the
+                // round before reached: a reader seeded at an offset takes its
+                // running checksum from the frame before it.
+                let from = match &tail {
+                    Some(t) if t.max_offset > 0 => t.max_offset,
+                    _ => offset,
+                };
                 let valid_end = {
-                    let parsed = if offset == WAL_HEADER_SIZE as i64 {
+                    let parsed = if from == WAL_HEADER_SIZE as i64 {
                         WalReader::new(&bytes)
                     } else if tail_base == 0 {
-                        WalReader::new_with_offset(&bytes, offset, salt1, salt2)
+                        WalReader::new_with_offset(&bytes, from, salt1, salt2)
                     } else {
                         WalReader::new_with_offset_over_tail(
                             &bytes,
                             tail_base as i64,
-                            offset,
+                            from,
                             salt1,
                             salt2,
                         )
@@ -1417,9 +1432,26 @@ impl Db {
                     let mut reader = parsed.map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
                     })?;
-                    reader.page_map().map_err(|error| {
+                    if from == WAL_HEADER_SIZE as i64 {
+                        (salt1, salt2) = reader.salt();
+                    }
+                    let before = reader.offset();
+                    let (pages, max_offset, commit) = reader.page_map().map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
                     })?;
+                    parsed_frames += frames_between(before, reader.offset(), frame_size);
+                    let t = tail.get_or_insert_with(|| ParsedTail {
+                        pages: HashMap::new(),
+                        max_offset: 0,
+                        commit: 0,
+                        salt: (salt1, salt2),
+                    });
+                    t.salt = (salt1, salt2);
+                    if max_offset > 0 {
+                        t.pages.extend(pages);
+                        t.max_offset = max_offset;
+                        t.commit = commit;
+                    }
                     if reader.offset() == 0 {
                         WAL_HEADER_SIZE
                     } else {
@@ -1441,6 +1473,8 @@ impl Db {
                             file_len,
                         },
                         read_bytes,
+                        parsed_frames,
+                        tail.take().map(ParsedTail::finish),
                     ));
                 }
                 if cursor == complete_end {
@@ -1451,6 +1485,8 @@ impl Db {
                             file_len,
                         },
                         read_bytes,
+                        parsed_frames,
+                        tail.take().map(ParsedTail::finish),
                     ));
                 }
                 target_frames = target_frames.saturating_mul(2);
@@ -1496,6 +1532,7 @@ impl Db {
         // unchanged. An I/O race or a previous-frame mismatch falls back to
         // the full read the port always did.
         let frame_size_bytes = self.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
+        let mut walked: Option<ParsedTail> = None;
         let mut wal = if info.snapshotting {
             self.last_sync_timing.wal_read_kind = 1;
             let bytes = self.host.read(&self.wal_path())?;
@@ -1509,7 +1546,9 @@ impl Db {
                 (info.offset - frame_size_bytes) as usize
             };
             match self.read_valid_wal_image(&info, start) {
-                Ok((image, read_bytes)) => {
+                Ok((image, read_bytes, parsed_frames, parsed)) => {
+                    self.last_sync_timing.wal_frames_parsed += parsed_frames;
+                    walked = parsed;
                     self.last_sync_timing.wal_read_kind =
                         if start == WAL_HEADER_SIZE { 2 } else { 0 };
                     self.last_sync_timing.wal_read_bytes = read_bytes as u64;
@@ -1569,7 +1608,16 @@ impl Db {
                 .map_err(Error::from)?
         };
 
-        let (page_map, max_offset, wal_commit) = rd.page_map().map_err(Error::from)?;
+        let (page_map, max_offset, wal_commit, (rd_salt1, rd_salt2)) = match walked.take() {
+            Some(t) if !mismatch => (t.pages, t.max_offset, t.commit, t.salt),
+            _ => {
+                let before = rd.offset();
+                let (page_map, max_offset, wal_commit) = rd.page_map().map_err(Error::from)?;
+                self.last_sync_timing.wal_frames_parsed +=
+                    frames_between(before, rd.offset(), frame_size_bytes as usize);
+                (page_map, max_offset, wal_commit, rd.salt())
+            }
+        };
         if wal_commit > 0 {
             commit = wal_commit;
         }
@@ -1594,8 +1642,6 @@ impl Db {
         if !info.snapshotting && sz == 0 {
             return Ok(false);
         }
-
-        let (rd_salt1, rd_salt2) = rd.salt();
 
         // The incremental path buffers its page set: it is the WAL growth,
         // not the database. A snapshot is every page, so it streams one page
@@ -2433,6 +2479,37 @@ impl Db {
 }
 
 // ── free functions ─────────────────────────────────────────────────────────
+
+/// The page map of a WAL tail the valid-image read already walked, handed
+/// to the capture so it does not walk the tail again.
+struct ParsedTail {
+    pages: HashMap<u32, i64>,
+    max_offset: i64,
+    commit: u32,
+    salt: (u32, u32),
+}
+
+impl ParsedTail {
+    /// Drops pages past the final database size, as one walk would have.
+    fn finish(mut self) -> Self {
+        let commit = self.commit;
+        self.pages.retain(|&pgno, _| pgno <= commit);
+        self
+    }
+}
+
+/// Frames a reader advanced from `before` to `after`, both
+/// [`WalReader::offset`]s (0 before any frame).
+fn frames_between(before: i64, after: i64, frame_size: usize) -> u64 {
+    let at = |o: i64| {
+        if o == 0 {
+            0
+        } else {
+            (o - WAL_HEADER_SIZE as i64) / frame_size as i64 + 1
+        }
+    };
+    (at(after) - at(before)).max(0) as u64
+}
 
 /// Returns the size of the WAL for a given page size & count, in i64 math to
 /// avoid u32 overflow with large page sizes. Ported from `calcWALSize`

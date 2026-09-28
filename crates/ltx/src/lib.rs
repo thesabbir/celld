@@ -348,26 +348,27 @@ pub fn parse_pos(s: &str) -> Result<Pos> {
 pub fn wal_checksum(big_endian: bool, s0: u32, s1: u32, b: &[u8]) -> (u32, u32) {
     assert!(b.len().is_multiple_of(8), "misaligned checksum byte slice");
 
-    let mut s0 = s0;
-    let mut s1 = s1;
+    // Endianness picked once, outside the loop, and whole 8-byte units with
+    // no per-byte bounds checks: the frame walk of every capture runs here.
+    let (units, _) = b.as_chunks::<8>();
+    if big_endian {
+        wal_checksum_units(s0, s1, units, u32::from_be_bytes)
+    } else {
+        wal_checksum_units(s0, s1, units, u32::from_le_bytes)
+    }
+}
 
-    // Iterate over 8-byte units and compute checksum.
-    // Matches litestream.go Checksum loop exactly.
-    let mut i = 0usize;
-    while i < b.len() {
-        let w0 = if big_endian {
-            u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-        } else {
-            u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-        };
-        let w1 = if big_endian {
-            u32::from_be_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]])
-        } else {
-            u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]])
-        };
-        s0 = s0.wrapping_add(w0).wrapping_add(s1);
-        s1 = s1.wrapping_add(w1).wrapping_add(s0);
-        i += 8;
+#[inline(always)]
+fn wal_checksum_units(
+    mut s0: u32,
+    mut s1: u32,
+    units: &[[u8; 8]],
+    word: impl Fn([u8; 4]) -> u32,
+) -> (u32, u32) {
+    for unit in units {
+        let [a, b, c, d, e, f, g, h] = *unit;
+        s0 = s0.wrapping_add(word([a, b, c, d])).wrapping_add(s1);
+        s1 = s1.wrapping_add(word([e, f, g, h])).wrapping_add(s0);
     }
     (s0, s1)
 }
