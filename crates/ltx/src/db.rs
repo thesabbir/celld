@@ -1508,9 +1508,12 @@ impl Db {
 
         let (rd_salt1, rd_salt2) = rd.salt();
 
-        // Build the page set for the encoder.
+        // The incremental path buffers its page set: it is the WAL growth,
+        // not the database. A snapshot is every page, so it streams one page
+        // at a time from the WAL image or the database straight into the
+        // .tmp file (below) and never holds a copy of the database.
         let pages: Vec<(u32, Vec<u8>)> = if info.snapshotting {
-            self.collect_snapshot_pages(&wal, &page_map, commit)?
+            Vec::new()
         } else {
             self.collect_wal_pages(&wal, &page_map, info.prev_commit, commit)?
         };
@@ -1534,7 +1537,12 @@ impl Db {
         };
 
         // Encode the LTX file (with HeaderFlagNoChecksum, so post-apply is 0).
-        let encoded = ltx::encode_file(&header, &pages, 0)?;
+        let encoded = if info.snapshotting {
+            Vec::new()
+        } else {
+            ltx::encode_file(&header, &pages, 0)?
+        };
+        drop(pages);
         self.last_sync_timing.ltx_encode_us = crate::host::telemetry_us().saturating_sub(phase);
         let phase = crate::host::telemetry_us();
 
@@ -1551,16 +1559,26 @@ impl Db {
         // (db.go:1680-1684); the error path below does that. A directory
         // that vanished under a ready flag is recreated once and the cut
         // retried, so the flag saves a `mkdir` per sync without trusting it.
-        self.last_sync_timing.fsync_us =
-            match write_file_atomic(&self.host, &tmp_filename, &filename, &encoded) {
+        let mut encoded_len = encoded.len() as u64;
+        let mut write = |file: &mut crate::host::HostFile| -> Result<()> {
+            if info.snapshotting {
+                encoded_len = self.stream_snapshot(file, header, &wal, &page_map, commit)?;
+            } else {
+                std::io::Write::write_all(file, &encoded)?;
+            }
+            Ok(())
+        };
+        let fsync_us =
+            match write_file_atomic_with(&self.host, &tmp_filename, &filename, &mut write) {
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(parent) = &parent {
                         self.host.create_dir_all(parent)?;
                     }
-                    write_file_atomic(&self.host, &tmp_filename, &filename, &encoded)?
+                    write_file_atomic_with(&self.host, &tmp_filename, &filename, &mut write)?
                 }
                 other => other?,
             };
+        self.last_sync_timing.fsync_us = fsync_us;
         self.last_sync_timing.file_write_us = crate::host::telemetry_us()
             .saturating_sub(phase)
             .saturating_sub(self.last_sync_timing.fsync_us);
@@ -1596,7 +1614,7 @@ impl Db {
             max_txid: tx_id,
             pre_apply_checksum: 0,
             post_apply_checksum: 0,
-            size: encoded.len() as i64,
+            size: encoded_len as i64,
             created_at: Some(system_time_from_unix_millis(self.host.now_unix_millis())),
         });
         // The encoder's post-apply pos: for a NoChecksum file the post-apply
@@ -1647,25 +1665,36 @@ impl Db {
         Ok(out)
     }
 
-    /// Collects the full page set for a snapshot: every page `1..=commit`
-    /// (skipping the lock page), reading from the WAL where present, else the DB
-    /// file. Ported from `DB.writeLTXFromDB` (db.go:1725-1770).
-    fn collect_snapshot_pages(
+    /// Streams a snapshot L0 into `out`: every page `1..=commit` (skipping
+    /// the lock page), from the WAL where present, else the DB file, one page
+    /// live at a time. Returns the bytes written. Ported from
+    /// `DB.writeLTXFromDB` (db.go:1725-1770).
+    fn stream_snapshot(
         &self,
+        out: &mut crate::host::HostFile,
+        header: ltx::Header,
         wal: &WalImage,
         page_map: &HashMap<u32, i64>,
         commit: u32,
-    ) -> Result<Vec<(u32, Vec<u8>)>> {
+    ) -> Result<u64> {
+        let mut counted = Counted {
+            inner: std::io::BufWriter::new(out),
+            n: 0,
+        };
+        let mut encoder = crate::codec::Encoder::new_legacy(&mut counted);
+        encoder.encode_header(header)?;
         let lock = lock_pgno(self.page_size);
-        let mut out = Vec::with_capacity(commit as usize);
         for pgno in (1..=commit).filter(|pgno| *pgno != lock) {
             let data = match page_map.get(&pgno) {
                 Some(&offset) => wal.page(offset, self.page_size)?,
                 None => self.read_db_page(pgno)?,
             };
-            out.push((pgno, data));
+            encoder.encode_page(ltx::PageHeader { pgno, flags: 0 }, &data)?;
         }
-        Ok(out)
+        encoder.close(0)?;
+        drop(encoder);
+        std::io::Write::flush(&mut counted.inner)?;
+        Ok(counted.n)
     }
 
     /// Reads one page of the main database through the connection's VFS file,
@@ -2336,9 +2365,40 @@ fn write_file_atomic(
     final_path: &str,
     data: &[u8],
 ) -> Result<u64> {
+    write_file_atomic_with(host, tmp_path, final_path, &mut |file| {
+        file.write_all(data)?;
+        Ok(())
+    })
+}
+
+/// A byte counter over a writer: the streamed L0's size for the file-info
+/// cache, without a second stat.
+struct Counted<W> {
+    inner: W,
+    n: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for Counted<W> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(b)?;
+        self.n += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// [`write_file_atomic`] with the body written by `fill`.
+fn write_file_atomic_with(
+    host: &crate::LtxHost,
+    tmp_path: &str,
+    final_path: &str,
+    fill: &mut dyn FnMut(&mut crate::host::HostFile) -> Result<()>,
+) -> Result<u64> {
     let result = (|| -> Result<u64> {
         let mut file = host.create(Path::new(tmp_path))?;
-        file.write_all(data)?;
+        fill(&mut file)?;
         let fsync = crate::host::telemetry_us();
         file.sync_all()?;
         let fsync_us = crate::host::telemetry_us().saturating_sub(fsync);
