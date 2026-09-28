@@ -56,7 +56,7 @@ use crate::{
 use rusqlite::ffi;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -236,6 +236,9 @@ pub struct SyncTiming {
     /// The bytes the sync allocated to hold what it read: the tail plus the
     /// header on the tail path, the file otherwise.
     pub wal_image_bytes: u64,
+    /// What `verify` read of the WAL to tell a restart from a missed
+    /// FULL or RESTART checkpoint.
+    pub restart_scan_bytes: u64,
     /// Which verify branch forced the snapshot: 0 none, 1 first sync,
     /// 2 wal truncated by another process, 3 salt reset, 4 last page
     /// missing from the last L0, 5 full or restart checkpoint detected,
@@ -1319,11 +1322,38 @@ impl Db {
 
     /// Detects whether a FULL or RESTART checkpoint occurred (we may have missed
     /// frames). Ported from `DB.detectFullCheckpoint` (db.go:1477-1507).
-    fn detect_full_checkpoint(&self, known_salts: &[(u32, u32)]) -> Result<bool> {
-        let wal_bytes = self.host.read(&self.wal_path())?;
-        let rd = WalReader::new(&wal_bytes).map_err(Error::from)?;
+    fn detect_full_checkpoint(&mut self, known_salts: &[(u32, u32)]) -> Result<bool> {
+        // Frame headers only, a chunk of frames at a time, until the first
+        // frame of the last known WAL: after a restart that is the few frames
+        // written since, and the rest of the file is the old WAL. Reading the
+        // whole file cost its size in memory and tens of milliseconds under
+        // the seal at a 200 MB WAL.
+        const CHUNK_FRAMES: i64 = 256;
+        let header = self.wal_header_bytes()?;
+        let page_size = i64::from(WalReader::new(&header).map_err(Error::from)?.page_size());
+        let len = self.wal_file_size()?;
+        let step = WAL_FRAME_HEADER_SIZE as i64 + page_size;
         let last_known = known_salts.last().copied().unwrap_or((0, 0));
-        let mut m = rd.frame_salts_until(last_known);
+        let mut m = HashSet::new();
+        let mut offset = WAL_HEADER_SIZE as i64;
+        let mut scanned = WAL_HEADER_SIZE as u64;
+        'scan: while offset + WAL_FRAME_HEADER_SIZE as i64 <= len {
+            let frames = ((len - offset) / step).clamp(1, CHUNK_FRAMES);
+            let n = (frames * step).min(len - offset);
+            let chunk = self.wal_bytes_at(offset, n)?;
+            scanned += n as u64;
+            let mut at = 0usize;
+            while at + WAL_FRAME_HEADER_SIZE <= chunk.len() {
+                let salts = (be_u32(&chunk[at + 8..]), be_u32(&chunk[at + 12..]));
+                m.insert(salts);
+                if salts == last_known {
+                    break 'scan;
+                }
+                at += step as usize;
+            }
+            offset += n;
+        }
+        self.last_sync_timing.restart_scan_bytes = scanned;
         for s in known_salts {
             m.remove(s);
         }
