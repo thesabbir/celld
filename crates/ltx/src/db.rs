@@ -254,6 +254,9 @@ pub struct SyncTiming {
     /// reader that pinned the WAL.
     pub checkpoint_wal_frames: u64,
     pub checkpoint_backfilled: u64,
+    /// Frames the second passive pass backfilled with writers held off: the
+    /// tail they appended during the first. Zero when there was none.
+    pub checkpoint_tail_backfilled: u64,
     /// One when the pragma reported a lock it could not take (its first
     /// column), and one when the checkpoint path failed with `SQLITE_BUSY`
     /// and the sync swallowed the error.
@@ -263,6 +266,12 @@ pub struct SyncTiming {
     /// logical WAL restarted at its header.
     pub checkpoint_restarts: u64,
 }
+
+/// Takes a turn at the file's write lock, shared with the process's own
+/// writer; the turn lasts until the returned value is dropped. Without one,
+/// a capture's short write transactions compete for SQLite's lock through
+/// the busy handler, and a writer committing back to back can win every time.
+pub type WriteTurn = std::sync::Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>;
 
 pub struct Db {
     host: crate::LtxHost,
@@ -281,6 +290,9 @@ pub struct Db {
     /// So the read lock gets its own connection, mirroring the pool's separation.
     rtx_conn: Connection,
     page_size: u32,
+
+    /// Held only while this takes SQLite's write lock ([`Db::set_write_turn`]).
+    write_turn: Option<WriteTurn>,
 
     /// `true` while the long-running read transaction is open (db.go:70 `rtx`).
     /// We track a flag rather than holding a borrowing `rusqlite::Transaction`.
@@ -475,6 +487,7 @@ impl Db {
             conn,
             rtx_conn,
             page_size: 0,
+            write_turn: None,
             read_lock_held: false,
             last_sync_timing: SyncTiming::default(),
             min_checkpoint_page_n: Self::DEFAULT_MIN_CHECKPOINT_PAGE_N,
@@ -547,6 +560,19 @@ impl Db {
     }
 
     /// The database file path. Ported from `DB.Path` (db.go:275).
+    /// Take `turn` around each step that takes SQLite's write lock: the
+    /// control-table writes, the passive checkpoint's sealing barrier, a
+    /// checkpoint that waits for writers, and the capture after a WAL restart.
+    /// Nothing else holds it, so a writer sharing it waits out those steps and
+    /// not a whole capture or backfill.
+    pub fn set_write_turn(&mut self, turn: Option<WriteTurn>) {
+        self.write_turn = turn;
+    }
+
+    fn write_turn(&self) -> Option<Box<dyn std::any::Any>> {
+        self.write_turn.as_ref().map(|turn| turn())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -678,9 +704,11 @@ impl Db {
         if self.verified_schema_version == Some(version) {
             return Ok(());
         }
+        let turn = self.write_turn();
         self.conn
             .execute_batch(CONTROL_TABLES_DDL)
             .map_err(sql_err)?;
+        drop(turn);
         let verified: i64 = self
             .conn
             .prepare_cached("PRAGMA schema_version")
@@ -746,6 +774,7 @@ impl Db {
         if self.wal_file_size()? >= WAL_HEADER_SIZE as i64 {
             return Ok(());
         }
+        let _turn = self.write_turn();
         self.conn
             .execute_batch(
                 "INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) \
@@ -1870,14 +1899,37 @@ impl Db {
         // short write transaction on the dedicated read-lock connection, then
         // sync again to seal every commit before running the checkpoint on the
         // main connection. Keep the barrier until the checkpoint completes.
+        let mut tail_pass = None;
         let pragma = if mode == CheckpointMode::Passive {
-            self.exec_passive_checkpoint_with_barrier(hdr, passive_hook, passive_unlocked_hook)?
+            let bulk = self.exec_passive_checkpoint_with_barrier(
+                hdr,
+                passive_hook,
+                passive_unlocked_hook,
+                false,
+            )?;
+            // Writers went on through the backfill, so the WAL holds frames
+            // it did not copy and will not restart. A second pass holds the
+            // barrier through its backfill, of that tail only, so the next
+            // write restarts the WAL instead of growing it.
+            if bulk.backfilled < bulk.wal_frames || self.wal_header_bytes()? != hdr {
+                let tail = self.exec_passive_checkpoint_with_barrier(hdr, None, None, true)?;
+                tail_pass = Some((bulk, tail));
+                tail
+            } else {
+                bulk
+            }
         } else {
             self.exec_checkpoint(mode)?
         };
         self.last_sync_timing.checkpoint_runs = 1;
         self.last_sync_timing.checkpoint_wal_frames = pragma.wal_frames.max(0) as u64;
         self.last_sync_timing.checkpoint_backfilled = pragma.backfilled.max(0) as u64;
+        if let Some((bulk, tail)) = tail_pass {
+            self.last_sync_timing.checkpoint_wal_frames = bulk.wal_frames.max(0) as u64;
+            self.last_sync_timing.checkpoint_backfilled = bulk.backfilled.max(0) as u64;
+            self.last_sync_timing.checkpoint_tail_backfilled =
+                (tail.backfilled - bulk.backfilled).max(0) as u64;
+        }
         self.last_sync_timing.checkpoint_busy = u64::from(pragma.busy != 0);
         // The backfilled boundary in this WAL's coordinates. A short backfill
         // (a reader pinned the WAL) leaves the remainder counting toward the
@@ -1891,6 +1943,7 @@ impl Db {
 
         // Force a write so a restarted WAL has a new header and at least one
         // frame that verify can read.
+        let turn = self.write_turn();
         self.conn
             .execute_batch(
                 "INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) \
@@ -1939,6 +1992,7 @@ impl Db {
         })();
         // Always roll back the write transaction (db.go:1849,1867).
         let rb = rollback(&self.conn);
+        drop(turn);
         post?;
         rb?;
 
@@ -1966,12 +2020,14 @@ impl Db {
         pre_checkpoint_header: [u8; WAL_HEADER_SIZE],
         hook: Option<Box<dyn FnOnce() + Send>>,
         unlocked_hook: Option<Box<dyn FnOnce() + Send>>,
+        hold: bool,
     ) -> Result<CheckpointPragma> {
         self.release_read_lock()?;
         if let Some(hook) = unlocked_hook {
             hook();
         }
 
+        let turn = self.write_turn();
         let sealed = (|| -> Result<()> {
             self.rtx_conn
                 .prepare_cached("BEGIN")
@@ -2010,6 +2066,9 @@ impl Db {
                 self.verify_and_sync(None)?;
             }
 
+            if hold {
+                return Ok(());
+            }
             // Pin the sealed end before a writer can append past it.
             self.conn
                 .prepare_cached("BEGIN")
@@ -2027,8 +2086,23 @@ impl Db {
             Ok(())
         })();
 
+        if hold {
+            // The tail pass: backfill with the barrier held, so no writer
+            // appends past what it copies.
+            let result = sealed
+                .and_then(|()| Self::checkpoint_pragma_on(&self.conn, CheckpointMode::Passive));
+            let barrier_released = rollback(&self.rtx_conn);
+            drop(turn);
+            let reacquire_result = self.acquire_read_lock();
+            let pragma = result?;
+            barrier_released?;
+            reacquire_result?;
+            return Ok(pragma);
+        }
+
         // Release the writer barrier: writers commit from here on.
         let barrier_released = rollback(&self.rtx_conn);
+        drop(turn);
         if let Err(error) = sealed {
             let _ = self.acquire_read_lock();
             return Err(error);
@@ -2069,7 +2143,9 @@ impl Db {
         // re-acquire so it runs even on early return.
         self.release_read_lock()?;
 
+        let turn = self.write_turn();
         let result = self.run_checkpoint_pragma(mode);
+        drop(turn);
 
         // Re-acquire the read lock immediately after the checkpoint (the deferred
         // re-acquire in Go). If the pragma succeeded, propagate any re-acquire

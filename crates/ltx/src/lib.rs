@@ -57,7 +57,7 @@ pub use host::{
 
 /// A SQLite database managed for replication (WAL-mode checkpoint takeover plus
 /// the WAL→LTX capture loop). Re-exported from [`crate::db::Db`].
-pub use db::Db;
+pub use db::{Db, WriteTurn};
 
 /// SQLite checkpoint mode used by [`Db`] when it checkpoints the WAL.
 /// Re-exported from [`crate::db::CheckpointMode`].

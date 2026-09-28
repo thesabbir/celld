@@ -86,6 +86,16 @@ async fn a_writer_commits_while_a_passive_checkpoint_backfills() {
         timing.checkpoint_backfilled < timing.checkpoint_wal_frames,
         "the checkpoint backfilled past the seal: {timing:?}"
     );
+    // A second pass, writers held off, copied the tail they appended, so the
+    // WAL restarts instead of growing under a writer that never stops.
+    assert!(
+        timing.checkpoint_tail_backfilled > 0,
+        "no tail pass: {timing:?}"
+    );
+    assert_eq!(
+        timing.checkpoint_restarts, 1,
+        "the WAL did not restart: {timing:?}"
+    );
 
     // The commit the checkpoint did not seal still reaches the replica.
     write(&path, 20);
@@ -97,4 +107,60 @@ async fn a_writer_commits_while_a_passive_checkpoint_backfills() {
     assert_eq!(restored, rows(&path));
     assert_eq!(restored.len(), 271);
     assert!(restored.iter().any(|r| r == "during-the-checkpoint"));
+}
+
+/// A write turn the test can see: taking it counts, and `held` says whether
+/// one is out now.
+#[derive(Default)]
+struct Turns {
+    taken: std::sync::atomic::AtomicUsize,
+    held: std::sync::atomic::AtomicBool,
+}
+
+struct Held(Arc<Turns>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0
+            .held
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_passive_checkpoint_takes_the_write_turn_to_seal_and_not_to_backfill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("a.db");
+    write(&path, 50);
+    let mut db = Db::open(&path).expect("db");
+    db.sync().expect("capture");
+
+    let turns = Arc::new(Turns::default());
+    db.set_write_turn(Some(Arc::new({
+        let turns = turns.clone();
+        move || -> Box<dyn std::any::Any> {
+            use std::sync::atomic::Ordering::SeqCst;
+            turns.taken.fetch_add(1, SeqCst);
+            assert!(!turns.held.swap(true, SeqCst), "turns do not nest");
+            Box::new(Held(turns.clone()))
+        }
+    })));
+    write(&path, 200);
+
+    let during = Arc::new(Mutex::new(None));
+    let hook = {
+        let turns = turns.clone();
+        let during = during.clone();
+        Box::new(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            *during.lock().expect("lock") =
+                Some((turns.taken.load(SeqCst), turns.held.load(SeqCst)));
+        })
+    };
+    internal::checkpoint_passive_with_barrier_hook(&mut db, hook).expect("checkpoint");
+
+    let (sealed_under, held) = during.lock().expect("lock").take().expect("the hook ran");
+    assert!(sealed_under > 0, "the sealing barrier takes the write turn");
+    assert!(!held, "the backfill runs with the turn free");
+    assert!(!turns.held.load(std::sync::atomic::Ordering::SeqCst));
 }
