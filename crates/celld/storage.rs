@@ -681,9 +681,13 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
 fn without_sql_authorizer<T>(connection: &Connection, callback: impl FnOnce() -> T) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
 
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("toggle the SQL authorizer");
     let result = callback();
-    connection.authorizer(Some(authorize_sql));
+    connection
+        .authorizer(Some(authorize_sql))
+        .expect("toggle the SQL authorizer");
     result
 }
 
@@ -693,9 +697,13 @@ fn without_sql_authorizer_mut<T>(
 ) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
 
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("toggle the SQL authorizer");
     let result = callback(connection);
-    connection.authorizer(Some(authorize_sql));
+    connection
+        .authorizer(Some(authorize_sql))
+        .expect("toggle the SQL authorizer");
     result
 }
 
@@ -860,7 +868,7 @@ fn finish_open(
             rusqlite::ffi::sqlite3_limit(database, category, limit);
         }
     }
-    c.authorizer(Some(authorize_sql));
+    c.authorizer(Some(authorize_sql))?;
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
     c.set_prepared_statement_cache_capacity(64);
@@ -1079,11 +1087,7 @@ pub(crate) fn open_embedded(
             .optional()?;
         if let Some(image) = image {
             let mut source = Connection::open_in_memory()?;
-            source.deserialize(
-                rusqlite::MAIN_DB,
-                owned_sqlite_data(&image)?,
-                true,
-            )?;
+            source.deserialize(rusqlite::MAIN_DB, owned_sqlite_data(&image)?, true)?;
             rusqlite::backup::Backup::new(&source, &mut connection)?
                 .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
                 .context("import the facet's legacy image")?;

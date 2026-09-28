@@ -2431,7 +2431,8 @@ pub mod internal {
             conn.authorizer(Some(move |_: AuthContext<'_>| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Authorization::Allow
-            }));
+            }))
+            .expect("install the compile-counting authorizer");
         }
         counter
     }
