@@ -459,8 +459,8 @@ impl Db {
         // This connection runs one tiny read to take the read lock and then
         // idles for the whole residency, so SQLite's default page-cache limit
         // (-2000 = up to 2 MiB) is dead weight repeated per resident cell.
-        // Cap it at a few pages; no user query or checkpoint runs here, so a
-        // smaller cache cannot slow either path.
+        // Cap it at a few pages; no user query runs here, and the passive
+        // checkpoint it runs copies WAL frames without the page cache.
         rtx_conn
             .pragma_update(None, "cache_size", -16)
             .map_err(sql_err)?;
@@ -1946,12 +1946,21 @@ impl Db {
         Ok(())
     }
 
-    /// Seals and runs a passive checkpoint while holding SQLite's writer lock.
+    /// Seals, then runs a passive checkpoint with writers free to commit.
     ///
     /// The long-lived read transaction uses `rtx_conn`, so this method releases
-    /// that read lock and temporarily reuses the same connection for the writer
-    /// barrier. The checkpoint itself runs through `conn`, as SQLite does not
-    /// permit a checkpoint on the connection that owns the write transaction.
+    /// that read lock and reuses the same connection for a short writer
+    /// barrier: with no writer between them, the seal captures the whole WAL.
+    /// Before the barrier drops, `conn` starts a read transaction, pinned at
+    /// the sealed end. SQLite backfills no frame past the oldest reader's mark
+    /// and restarts no WAL a reader still uses, so the checkpoint copies
+    /// sealed frames only and a commit after the seal stays in the WAL for the
+    /// next capture. The checkpoint then runs on `rtx_conn`, the connection
+    /// with no transaction; `conn` cannot checkpoint while it holds the pin.
+    ///
+    /// The barrier used to be held through the backfill. Under a sustained
+    /// write load every checkpoint then stalled the writer for the whole copy,
+    /// 30-150 ms each second.
     fn exec_passive_checkpoint_with_barrier(
         &mut self,
         pre_checkpoint_header: [u8; WAL_HEADER_SIZE],
@@ -1963,7 +1972,7 @@ impl Db {
             hook();
         }
 
-        let result = (|| -> Result<CheckpointPragma> {
+        let sealed = (|| -> Result<()> {
             self.rtx_conn
                 .prepare_cached("BEGIN")
                 .and_then(|mut statement| statement.execute([]))
@@ -2000,21 +2009,51 @@ impl Db {
                 // checkpoint.
                 self.verify_and_sync(None)?;
             }
-            if let Some(hook) = hook {
-                hook();
+
+            // Pin the sealed end before a writer can append past it.
+            self.conn
+                .prepare_cached("BEGIN")
+                .and_then(|mut statement| statement.execute([]))
+                .map_err(sql_err)?;
+            if let Err(e) = self
+                .conn
+                .query_row("SELECT COUNT(1) FROM _litestream_seq", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            {
+                let _ = rollback(&self.conn);
+                return Err(sql_err(e));
             }
-            self.run_checkpoint_pragma(CheckpointMode::Passive)
+            Ok(())
         })();
 
-        // Release the writer barrier before restoring the long-lived read lock.
-        // Preserve the operation error if both the operation and cleanup fail.
-        let rollback_result = rollback(&self.rtx_conn);
+        // Release the writer barrier: writers commit from here on.
+        let barrier_released = rollback(&self.rtx_conn);
+        if let Err(error) = sealed {
+            let _ = self.acquire_read_lock();
+            return Err(error);
+        }
+        if let Err(error) = barrier_released {
+            let _ = rollback(&self.conn);
+            let _ = self.acquire_read_lock();
+            return Err(error);
+        }
+
+        if let Some(hook) = hook {
+            hook();
+        }
+        let result = Self::checkpoint_pragma_on(&self.rtx_conn, CheckpointMode::Passive);
+
+        // Take the long-lived read lock back before the pin goes, so no
+        // moment leaves the WAL free to restart. Preserve the operation error
+        // if both the operation and cleanup fail.
         let reacquire_result = self.acquire_read_lock();
+        let unpin_result = rollback(&self.conn);
         match result {
             Err(error) => Err(error),
             Ok(pragma) => {
-                rollback_result?;
                 reacquire_result?;
+                unpin_result?;
                 Ok(pragma)
             }
         }
@@ -2045,9 +2084,14 @@ impl Db {
 
     /// Runs the raw `PRAGMA wal_checkpoint(<mode>)` and reads its 3-int result.
     fn run_checkpoint_pragma(&self, mode: CheckpointMode) -> Result<CheckpointPragma> {
+        Self::checkpoint_pragma_on(&self.conn, mode)
+    }
+
+    /// `PRAGMA wal_checkpoint(<mode>)` on `conn`, which must hold no
+    /// transaction.
+    fn checkpoint_pragma_on(conn: &Connection, mode: CheckpointMode) -> Result<CheckpointPragma> {
         let sql = format!("PRAGMA wal_checkpoint({mode})");
-        self.conn
-            .prepare_cached(&sql)
+        conn.prepare_cached(&sql)
             .map_err(sql_err)?
             .query_row([], |row| {
                 Ok(CheckpointPragma {
