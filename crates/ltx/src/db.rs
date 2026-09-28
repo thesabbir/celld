@@ -147,6 +147,13 @@ struct SyncInfo {
     reason: String,
 }
 
+/// At most this many unlocked passes run after a passive checkpoint's bulk
+/// pass, before the pass that holds the writer.
+const PASSIVE_CATCH_UP_PASSES: usize = 3;
+/// A pass that found at most this many new frames ends the unlocked passes:
+/// the held pass copies about as many, a few milliseconds of writer stall.
+const PASSIVE_HELD_TAIL_FRAMES: i64 = 64;
+
 /// Databases larger than this many pages (4 MiB at 4 KiB) must outgrow
 /// themselves in the WAL before a TRUNCATE checkpoint, since the checkpoint
 /// ends in a boundary image of the whole database. Smaller ones keep the
@@ -254,8 +261,11 @@ pub struct SyncTiming {
     /// reader that pinned the WAL.
     pub checkpoint_wal_frames: u64,
     pub checkpoint_backfilled: u64,
-    /// Frames the second passive pass backfilled with writers held off: the
-    /// tail they appended during the first. Zero when there was none.
+    /// Frames the unlocked passes after the bulk pass backfilled, writers
+    /// still committing: what the held pass no longer has to copy.
+    pub checkpoint_catch_up_backfilled: u64,
+    /// Frames the last passive pass backfilled with writers held off: the
+    /// tail they appended during the pass before it. Zero when there was none.
     pub checkpoint_tail_backfilled: u64,
     /// One when the pragma reported a lock it could not take (its first
     /// column), and one when the checkpoint path failed with `SQLITE_BUSY`
@@ -317,6 +327,9 @@ pub struct Db {
     synced_since_checkpoint: bool,
     /// True if the last sync reached the exact WAL EOF (#927, db.go:88).
     synced_to_wal_end: bool,
+    /// `conn` still holds the read transaction an unlocked passive pass
+    /// pinned at its sealed end, handed on to the next barrier.
+    passive_pin_held: bool,
     /// Logical end of WAL content after the last sync = `WALOffset + WALSize`
     /// from the last LTX (#997, db.go:96). Used for checkpoint thresholds
     /// instead of file size (stale post-checkpoint frames inflate file size).
@@ -496,6 +509,7 @@ impl Db {
             busy_timeout: Self::DEFAULT_BUSY_TIMEOUT,
             synced_since_checkpoint: false,
             synced_to_wal_end: false,
+            passive_pin_held: false,
             last_synced_wal_offset: 0,
             last_db_pages: 0,
             checkpointed_wal_offset: 0,
@@ -1908,13 +1922,36 @@ impl Db {
                 false,
             )?;
             // Writers went on through the backfill: the WAL holds frames it
-            // did not copy, or the long-lived read lock came back on frames
-            // they appended, and either keeps the WAL from restarting. A
-            // second pass holds the writer off through its backfill, of that
-            // tail only, so the next write restarts the WAL.
+            // did not copy, and the long-lived read lock came back on frames
+            // they appended, which keeps the WAL from restarting. A last pass
+            // holds the writer off through its backfill, of that tail only,
+            // so the next write restarts the WAL.
+            //
+            // Under a steady write load the tail is whatever landed during
+            // the bulk copy, and holding the writer through all of it stalled
+            // every write for tens of milliseconds. Unlocked passes copy it
+            // first, each over what the one before left, until one finds
+            // little new: the copy outruns the writers, so a few passes leave
+            // the held pass a short tail.
+            if bulk.wal_frames == 0 {
+                self.release_passive_pin()?;
+            }
             if bulk.wal_frames > 0 {
+                let mut last = bulk;
+                for _ in 0..PASSIVE_CATCH_UP_PASSES {
+                    let pass = self
+                        .exec_passive_checkpoint_with_barrier(hdr, None, None, false)
+                        .inspect_err(|_| {
+                            let _ = self.release_passive_pin();
+                        })?;
+                    let appended = pass.wal_frames - last.backfilled;
+                    last = pass;
+                    if appended <= PASSIVE_HELD_TAIL_FRAMES {
+                        break;
+                    }
+                }
                 let tail = self.exec_passive_checkpoint_with_barrier(hdr, None, None, true)?;
-                tail_pass = Some((bulk, tail));
+                tail_pass = Some((bulk, last, tail));
                 tail
             } else {
                 bulk
@@ -1925,11 +1962,13 @@ impl Db {
         self.last_sync_timing.checkpoint_runs = 1;
         self.last_sync_timing.checkpoint_wal_frames = pragma.wal_frames.max(0) as u64;
         self.last_sync_timing.checkpoint_backfilled = pragma.backfilled.max(0) as u64;
-        if let Some((bulk, tail)) = tail_pass {
+        if let Some((bulk, caught_up, tail)) = tail_pass {
             self.last_sync_timing.checkpoint_wal_frames = bulk.wal_frames.max(0) as u64;
             self.last_sync_timing.checkpoint_backfilled = bulk.backfilled.max(0) as u64;
+            self.last_sync_timing.checkpoint_catch_up_backfilled =
+                (caught_up.backfilled - bulk.backfilled).max(0) as u64;
             self.last_sync_timing.checkpoint_tail_backfilled =
-                (tail.backfilled - bulk.backfilled).max(0) as u64;
+                (tail.backfilled - caught_up.backfilled).max(0) as u64;
         }
         self.last_sync_timing.checkpoint_busy = u64::from(pragma.busy != 0);
         // The backfilled boundary in this WAL's coordinates. A short backfill
@@ -2038,6 +2077,9 @@ impl Db {
                 .prepare_cached("INSERT INTO _litestream_lock (id) VALUES (1)")
                 .and_then(|mut statement| statement.execute([]))
                 .map_err(sql_err)?;
+            // The writer lock is ours: the previous pass's pin can go without
+            // opening a moment for the WAL to restart.
+            self.release_passive_pin()?;
 
             // Writers can cross their own autocheckpoint threshold after the
             // read lock is released but before this barrier wins SQLite's
@@ -2119,19 +2161,37 @@ impl Db {
         }
         let result = Self::checkpoint_pragma_on(&self.rtx_conn, CheckpointMode::Passive);
 
-        // Take the long-lived read lock back before the pin goes, so no
-        // moment leaves the WAL free to restart. Preserve the operation error
-        // if both the operation and cleanup fail.
+        // The pin stays until the next barrier holds the writer lock. A
+        // reader taken after a full backfill reads the database file alone
+        // and does not keep a writer from restarting the WAL; the pin, taken
+        // before the backfill, does. Without it our own backfill let the WAL
+        // restart before the next barrier, which then could not tell that
+        // restart from another checkpointer's and sealed a boundary image.
         let reacquire_result = self.acquire_read_lock();
-        let unpin_result = rollback(&self.conn);
+        self.passive_pin_held = true;
         match result {
-            Err(error) => Err(error),
+            Err(error) => {
+                let _ = self.release_passive_pin();
+                Err(error)
+            }
             Ok(pragma) => {
-                reacquire_result?;
-                unpin_result?;
+                if let Err(error) = reacquire_result {
+                    let _ = self.release_passive_pin();
+                    return Err(error);
+                }
                 Ok(pragma)
             }
         }
+    }
+
+    /// Ends the read transaction an unlocked passive pass left on `conn`.
+    /// Idempotent.
+    fn release_passive_pin(&mut self) -> Result<()> {
+        if !self.passive_pin_held {
+            return Ok(());
+        }
+        self.passive_pin_held = false;
+        rollback(&self.conn)
     }
 
     /// Releases the read lock, runs `PRAGMA wal_checkpoint(<mode>)`, and
