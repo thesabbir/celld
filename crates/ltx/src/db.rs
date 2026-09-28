@@ -1907,11 +1907,12 @@ impl Db {
                 passive_unlocked_hook,
                 false,
             )?;
-            // Writers went on through the backfill, so the WAL holds frames
-            // it did not copy and will not restart. A second pass holds the
-            // barrier through its backfill, of that tail only, so the next
-            // write restarts the WAL instead of growing it.
-            if bulk.backfilled < bulk.wal_frames || self.wal_header_bytes()? != hdr {
+            // Writers went on through the backfill: the WAL holds frames it
+            // did not copy, or the long-lived read lock came back on frames
+            // they appended, and either keeps the WAL from restarting. A
+            // second pass holds the writer off through its backfill, of that
+            // tail only, so the next write restarts the WAL.
+            if bulk.wal_frames > 0 {
                 let tail = self.exec_passive_checkpoint_with_barrier(hdr, None, None, true)?;
                 tail_pass = Some((bulk, tail));
                 tail
