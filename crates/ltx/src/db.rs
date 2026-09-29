@@ -335,6 +335,8 @@ pub struct Db {
     /// `conn` still holds the read transaction an unlocked passive pass
     /// pinned at its sealed end, handed on to the next barrier.
     passive_pin_held: bool,
+    /// Test hook run right before the held tail pass takes its barrier.
+    tail_barrier_hook: Option<Box<dyn FnOnce() + Send>>,
     /// Logical end of WAL content after the last sync = `WALOffset + WALSize`
     /// from the last LTX (#997, db.go:96). Used for checkpoint thresholds
     /// instead of file size (stale post-checkpoint frames inflate file size).
@@ -515,6 +517,7 @@ impl Db {
             synced_since_checkpoint: false,
             synced_to_wal_end: false,
             passive_pin_held: false,
+            tail_barrier_hook: None,
             last_synced_wal_offset: 0,
             last_db_pages: 0,
             checkpointed_wal_offset: 0,
@@ -2026,7 +2029,14 @@ impl Db {
                         break;
                     }
                 }
-                let tail = self.exec_passive_checkpoint_with_barrier(hdr, None, None, true)?;
+                if let Some(hook) = self.tail_barrier_hook.take() {
+                    hook();
+                }
+                let tail = self
+                    .exec_passive_checkpoint_with_barrier(hdr, None, None, true)
+                    .inspect_err(|_| {
+                        let _ = self.release_passive_pin();
+                    })?;
                 tail_pass = Some((bulk, last, tail));
                 tail
             } else {
@@ -2917,6 +2927,17 @@ pub mod internal {
 
     pub fn ltx_level_dir(db: &Db, level: u32) -> String {
         db.ltx_level_dir(level)
+    }
+
+    /// Run `hook` right before the held tail pass of the next passive
+    /// checkpoint takes its barrier.
+    pub fn set_tail_barrier_hook(db: &mut Db, hook: Box<dyn FnOnce() + Send>) {
+        db.tail_barrier_hook = Some(hook);
+    }
+
+    /// Whether `conn` still holds an unlocked pass's read transaction.
+    pub fn passive_pin_held(db: &Db) -> bool {
+        db.passive_pin_held
     }
 
     pub fn checkpoint_passive_with_barrier_hook(
